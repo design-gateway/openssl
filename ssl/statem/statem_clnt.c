@@ -4100,31 +4100,68 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
     if (s->mode & SSL_MODE_SEND_FALLBACK_SCSV)
         maxlen -= 2;
 
-    for (i = 0; i < sk_SSL_CIPHER_num(sk) && totlen < maxlen; i++) {
-        const SSL_CIPHER *c;
+    // [DGTLS10GC] Start: Restrict allowed cipher suite to TLS_AES_256_GCM_SHA384
+    const char *econn = getenv("ECONN");
+    const char *hw_enable = getenv("HW_ENABLE");
+    if ( (econn!=NULL) && (strcmp("10",econn)==0) && (hw_enable!=NULL) && (strcmp("1",hw_enable)==0) )
+    {
+        for (i = 0; i < sk_SSL_CIPHER_num(sk) && totlen < maxlen; i++) {
+            const SSL_CIPHER *c;
 
-        c = sk_SSL_CIPHER_value(sk, i);
-        /* Skip disabled ciphers */
-        if (ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0))
-            continue;
+            c = sk_SSL_CIPHER_value(sk, i);
+            /* Skip disabled ciphers */
+            if (ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0))
+                continue;
 
-        if (!ssl->method->put_cipher_by_char(c, pkt, &len)) {
-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-            return 0;
+            /* Allow only TLS_AES_256_GCM_SHA384 (ID: 0x1302) */
+            if ((SSL_CIPHER_get_id(c)&0xFFFF) != 0x1302) // 0x1302 is TLS_AES_256_GCM_SHA384
+                continue;
+
+            if (!ssl->method->put_cipher_by_char(c, pkt, &len)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+
+            /* Sanity check that the maximum version we offer has ciphers enabled */
+            if (!maxverok) {
+                int minproto = SSL_CONNECTION_IS_DTLS(s) ? c->min_dtls : c->min_tls;
+                int maxproto = SSL_CONNECTION_IS_DTLS(s) ? c->max_dtls : c->max_tls;
+
+                if (ssl_version_cmp(s, maxproto, s->s3.tmp.max_ver) >= 0
+                        && ssl_version_cmp(s, minproto, s->s3.tmp.max_ver) <= 0)
+                    maxverok = 1;
+            }
+
+            totlen += len;
         }
+    } else {
+        for (i = 0; i < sk_SSL_CIPHER_num(sk) && totlen < maxlen; i++) {
+            const SSL_CIPHER *c;
 
-        /* Sanity check that the maximum version we offer has ciphers enabled */
-        if (!maxverok) {
-            int minproto = SSL_CONNECTION_IS_DTLS(s) ? c->min_dtls : c->min_tls;
-            int maxproto = SSL_CONNECTION_IS_DTLS(s) ? c->max_dtls : c->max_tls;
+            c = sk_SSL_CIPHER_value(sk, i);
+            /* Skip disabled ciphers */
+            if (ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0))
+                continue;
 
-            if (ssl_version_cmp(s, maxproto, s->s3.tmp.max_ver) >= 0
-                    && ssl_version_cmp(s, minproto, s->s3.tmp.max_ver) <= 0)
-                maxverok = 1;
+            if (!ssl->method->put_cipher_by_char(c, pkt, &len)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+
+            /* Sanity check that the maximum version we offer has ciphers enabled */
+            if (!maxverok) {
+                int minproto = SSL_CONNECTION_IS_DTLS(s) ? c->min_dtls : c->min_tls;
+                int maxproto = SSL_CONNECTION_IS_DTLS(s) ? c->max_dtls : c->max_tls;
+
+                if (ssl_version_cmp(s, maxproto, s->s3.tmp.max_ver) >= 0
+                        && ssl_version_cmp(s, minproto, s->s3.tmp.max_ver) <= 0)
+                    maxverok = 1;
+            }
+
+            totlen += len;
         }
-
-        totlen += len;
     }
+    // [DGTLS10GC] End
 
     if (totlen == 0 || !maxverok) {
         const char *maxvertext =

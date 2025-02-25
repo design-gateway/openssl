@@ -13,6 +13,8 @@
 #include "../record_local.h"
 #include "recmethod_local.h"
 
+#include "openssl/dgtls10gc.h"
+
 static int tls13_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
                                   unsigned char *key, size_t keylen,
                                   unsigned char *iv, size_t ivlen,
@@ -125,6 +127,34 @@ static int tls13_cipher(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *recs,
         /* RLAYERfatal already called */
         return 0;
     }
+
+    // [DGTLS10GC] Start: Modified to save the sequence number for the next record
+    const char *econn = getenv("ECONN");
+    const char *hw_enable = getenv("HW_ENABLE");
+    if ( (econn!=NULL) && (strcmp("10",econn)==0) && (hw_enable!=NULL) && (strcmp("1",hw_enable)==0) ) {
+        uint64_t dg_seq_num = 0;
+        for (loop = 0; loop < SEQ_NUM_SIZE; loop++)
+            dg_seq_num = (dg_seq_num<<8) | seq[loop];
+
+        BIO *lowest_bio = rl->bio;
+        while (BIO_next(lowest_bio) != NULL)
+            lowest_bio = BIO_next(lowest_bio);
+
+        if ( BIO_method_type(lowest_bio)==BIO_TYPE_DG ) {
+            BIO_BUF_DG *dg_buffer = (BIO_BUF_DG *)BIO_get_data(lowest_bio);
+            if (sending==1) {
+                dg_buffer->tx_seq_num_H = (dg_seq_num>>32);
+                dg_buffer->tx_seq_num_L = (dg_seq_num&0xFFFFFFFF);
+            } else {
+                dg_buffer->rx_seq_num_H = (dg_seq_num>>32);
+                dg_buffer->rx_seq_num_L = (dg_seq_num&0xFFFFFFFF);
+            }
+        } else {
+            RLAYERfatal(rl, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+    }
+    // [DGTLS10GC] End
 
     if (EVP_CipherInit_ex(ctx, NULL, NULL, NULL, iv, sending) <= 0
             || (!sending && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,

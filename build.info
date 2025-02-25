@@ -1,5 +1,6 @@
 # Note that some of these directories are filtered in Configure.  Look for
 # %skipdir there for further explanations.
+# [DGTLS10GC] Modified to include added files
 
 SUBDIRS=crypto ssl apps util tools fuzz providers doc
 IF[{- !$disabled{tests} -}]
@@ -37,6 +38,7 @@ DEPEND[]=include/openssl/asn1.h \
          include/openssl/pkcs7.h \
          include/openssl/safestack.h \
          include/openssl/srp.h \
+         include/openssl/dgtls10gc.h \
          include/openssl/ssl.h \
          include/openssl/ui.h \
          include/openssl/x509.h \
@@ -68,6 +70,7 @@ GENERATE[include/openssl/pkcs12.h]=include/openssl/pkcs12.h.in
 GENERATE[include/openssl/pkcs7.h]=include/openssl/pkcs7.h.in
 GENERATE[include/openssl/safestack.h]=include/openssl/safestack.h.in
 GENERATE[include/openssl/srp.h]=include/openssl/srp.h.in
+GENERATE[include/openssl/dgtls10gc.h]=include/openssl/dgtls10gc.h.in
 GENERATE[include/openssl/ssl.h]=include/openssl/ssl.h.in
 GENERATE[include/openssl/ui.h]=include/openssl/ui.h.in
 GENERATE[include/openssl/x509.h]=include/openssl/x509.h.in

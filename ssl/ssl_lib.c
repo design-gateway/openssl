@@ -28,6 +28,9 @@
 #include "internal/ktls.h"
 #include "quic/quic_local.h"
 
+#include "openssl/dgtls10gc.h"
+#include <time.h>
+
 static int ssl_undefined_function_3(SSL_CONNECTION *sc, unsigned char *r,
                                     unsigned char *s, size_t t, size_t *u)
 {
@@ -1395,6 +1398,29 @@ void SSL_free(SSL *s)
 
 void ossl_ssl_connection_free(SSL *ssl)
 {
+    // [DGTLS10GC] Start: Clear control flag
+    struct  timespec start_timestamp, current_timestamp;
+    uint32_t dgTLSbusy = 0;
+    uint32_t dgDMAbusy = 0;
+    // check Busy before free BIO_s_DG
+    clock_gettime(CLOCK_MONOTONIC, &start_timestamp);
+    do {
+        regRead(TLS_BUSY_REG,   &dgTLSbusy);
+        regRead(DMA_STATUS_REG, &dgDMAbusy);
+
+        clock_gettime(CLOCK_REALTIME, &current_timestamp);
+        if ( current_timestamp.tv_sec-start_timestamp.tv_sec > 5){
+            // TMO is met: Clear control flag
+            regWrite(TLS_BUSY_REG, 0);
+            regWrite(STS_IN_VALID_REG, 0);
+            regWrite(CTS_IN_VALID_REG, 0);
+            regWrite(TLS_PHASE_REG, 0);
+            break;
+        }
+    } while ( (dgTLSbusy!=0) || (dgDMAbusy!=0) );
+    // de-assert ConnOn signal
+    regWrite(TLS_BUSY_REG, 0);
+    // [DGTLS10GC] End
     SSL_CONNECTION *s;
 
     s = SSL_CONNECTION_FROM_SSL_ONLY(ssl);
@@ -1653,6 +1679,7 @@ static const BIO_METHOD *fd_method(SSL *s)
     return BIO_s_socket();
 }
 
+// MARK: SSL_set_fd()
 int SSL_set_fd(SSL *s, int fd)
 {
     int ret = 0;
@@ -1663,14 +1690,35 @@ int SSL_set_fd(SSL *s, int fd)
         goto err;
     }
 
-    bio = BIO_new(fd_method(s));
+    // [DGTLS10GC] Start: create dgBIO if 10G-Ethernet is used.
+    const char *econn;
+    econn = getenv("ECONN");
+    if ( (econn!=NULL) && strcmp("10",econn)==0 )
+    {   //enable 2 huge page (default = 1,page size = 2MB)
+        ret = system("echo 2 > /proc/sys/vm/nr_hugepages");
+        if (ret == -1) {
+            perror("system");
+            return -1;
+        }
 
-    if (bio == NULL) {
-        ERR_raise(ERR_LIB_SSL, ERR_R_BUF_LIB);
-        goto err;
+        bio = BIO_new(BIO_s_DG());
+
+        if (bio == NULL) {
+            ERR_print_errors_fp(stderr);
+            return -1;
+        }
+    } else {
+        bio = BIO_new(fd_method(s));
+
+        if (bio == NULL) {
+            ERR_raise(ERR_LIB_SSL, ERR_R_BUF_LIB);
+            goto err;
+        }
+        BIO_set_fd(bio, fd, BIO_NOCLOSE);
     }
-    BIO_set_fd(bio, fd, BIO_NOCLOSE);
+    // [DGTLS10GC] End
     SSL_set_bio(s, bio, bio);
+
 #ifndef OPENSSL_NO_KTLS
     /*
      * The new socket is created successfully regardless of ktls_enable.
@@ -2159,6 +2207,7 @@ int SSL_accept(SSL *s)
     return SSL_do_handshake(s);
 }
 
+// MARK: SSL_connect
 int SSL_connect(SSL *s)
 {
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(s);
@@ -2170,11 +2219,129 @@ int SSL_connect(SSL *s)
 
     if (sc == NULL)
         return 0;
+    // [DGTLS10GC] Start : Modify to use 10G Ethernet interface and external handshake feature of TLS10GC
+    const char *econn = getenv("ECONN");
+    if ( (econn!=NULL) && strcmp("10",econn)==0 ) {
+        // For sending key materials and set alert code to hardware
+        SSL_CTX *conn_ctx;
+        conn_ctx =  SSL_get_SSL_CTX(s);
+        SSL_CTX_set_keylog_callback(conn_ctx, dg_keylog_callback);
+        SSL_CTX_set_info_callback(conn_ctx, dg_ssl_info_callback);
+
+        // check Busy before creating BIO_s_DG
+        uint32_t dgTLSbusy = 0;
+        struct  timespec start_timestamp, current_timestamp;
+
+        clock_gettime(CLOCK_REALTIME, &start_timestamp);
+        do {
+            regRead(TLS_BUSY_REG,   &dgTLSbusy);
+            clock_gettime(CLOCK_REALTIME, &current_timestamp);
+            if ( current_timestamp.tv_sec-start_timestamp.tv_sec > 5){
+                regWrite(TLS_RSTB_REG, 0);
+                regWrite(TLS_RSTB_REG, 1);
+                regWrite(TLS_BUSY_REG, 0);
+                break;
+            }
+        }while ( dgTLSbusy!=0 );
+
+        // set TLS parameter
+        regWrite(TLS_BUSY_REG, 0);
+        regWrite(TLS_MODESET_REG, 0);
+        regWrite(TLS_PHASE_REG, 0);
+
+        // assert ConnOn signal to start TLS hardware
+        regWrite(TLS_BUSY_REG, 1);
+    }
+    // [DGTLS10GC] End
 
     if (sc->handshake_func == NULL) {
         /* Not properly initialized yet */
         SSL_set_connect_state(s);
     }
+
+    // [DGTLS10GC] Start: Set required parameters for external handshake feature of TLS10GC-IP
+    const char *hw_enable = getenv("HW_ENABLE");
+    if ( (econn!=NULL) && (strcmp("10",econn)==0) && (hw_enable!=NULL) && (strcmp("1",hw_enable)==0) ) {
+        int ret = SSL_do_handshake(s);
+        if ( ret==1 ) {
+            void *offset;
+            void *buf = NULL;
+            size_t readbytes;
+            // get the BIO pointers
+            BIO *rbio = SSL_get_rbio(s);
+            BIO_BUF_DG *buffer = (BIO_BUF_DG *)BIO_get_data(rbio);
+            // reset seq number
+            buffer->tx_seq_num_H = 0;
+            buffer->tx_seq_num_L = 0;
+            buffer->rx_seq_num_H = 0;
+            buffer->rx_seq_num_L = 0;
+            // check the remaining data which expected to be handshake type packet
+            int remain_data_len;
+            size_t len;
+            // check available data in DDR
+            offset = (uint32_t *)( (uint64_t)(buffer->hw_base_addr) + ((off_t)(APP_RX_WRPTR_REG) & (buffer->pagesize - 1)) );
+            buffer->rx_ddr_wr_pos = ( *(volatile uint32_t *)offset ) & BUFFER_MASK;
+
+            remain_data_len = (buffer->rx_ddr_wr_pos - buffer->rx_read_pos) & BUFFER_MASK;
+            len = remain_data_len;
+            while ( len>0 ){
+                if ( remain_data_len==0 ) {
+                    return ret;
+                } else {
+                    buf = malloc(remain_data_len*sizeof(char));
+                    if (buf == NULL)
+                        return 0;
+                    s->method->ssl_read_bytes(s, SSL3_RT_HANDSHAKE, NULL, buf, len, 0, &readbytes);
+                }
+                // check available data in DDR
+                offset = (uint32_t *)( (uint64_t)(buffer->hw_base_addr) + ((off_t)(APP_RX_WRPTR_REG) & (buffer->pagesize - 1)) );
+                buffer->rx_ddr_wr_pos = ( *(volatile uint32_t *)offset ) & BUFFER_MASK;
+
+                remain_data_len = (buffer->rx_ddr_wr_pos - buffer->rx_read_pos) & BUFFER_MASK;
+                len = remain_data_len;
+            }
+
+            //set start seq number
+            offset = (uint32_t *)( (uint64_t)(buffer->hw_base_addr) + ((off_t)(TX_SEQNUM_1_REG) & (buffer->pagesize - 1)) );
+            *(volatile uint32_t *)offset = buffer->tx_seq_num_H;
+            offset = (uint32_t *)( (uint64_t)(buffer->hw_base_addr) + ((off_t)(TX_SEQNUM_0_REG) & (buffer->pagesize - 1)) );
+            *(volatile uint32_t *)offset = buffer->tx_seq_num_L;
+
+            offset = (uint32_t *)( (uint64_t)(buffer->hw_base_addr) + ((off_t)(RX_SEQNUM_1_REG) & (buffer->pagesize - 1)) );
+            *(volatile uint32_t *)offset = buffer->rx_seq_num_H;
+            offset = (uint32_t *)( (uint64_t)(buffer->hw_base_addr) + ((off_t)(RX_SEQNUM_0_REG) & (buffer->pagesize - 1)) );
+            *(volatile uint32_t *)offset = buffer->rx_seq_num_L;
+
+            // Set UserTrnsEn : regWrite(TLS_PHASE_REG,1);
+            offset = (uint32_t *)( (uint64_t)(buffer->hw_base_addr) + ((off_t)(TLS_PHASE_REG) & (buffer->pagesize - 1)) );
+            *(volatile uint32_t *)offset = 1;
+        
+            uint32_t temp32b;
+            // Check the handshake status before returning from ssl_do_handshake().
+            struct  timespec start_timestamp, current_timestamp;
+            double  timeout = DG_SW_TMO;
+
+            clock_gettime(CLOCK_MONOTONIC, &start_timestamp);
+            do {
+                regRead(TLS_ALERT_REG, &temp32b);
+                if ( temp32b!=0 ) {
+                    SSLfatal_alert(SSL_CONNECTION_FROM_SSL(s), SSL_R_BAD_DATA);
+                    return -1;
+                }
+                // check TLS status
+                regRead(TLS_BUSY_REG, &temp32b);
+                clock_gettime(CLOCK_MONOTONIC, &current_timestamp);
+                if ( current_timestamp.tv_sec-start_timestamp.tv_sec > timeout){
+                    printf("\r\nHandshake TMO is met!\r\n \r\n");
+                    return -1;
+                }
+            } while ( (temp32b & 4) != 0 );
+
+            return 1;
+        }
+        return ret;
+    }
+    // [DGTLS10GC] End
 
     return SSL_do_handshake(s);
 }
@@ -2315,6 +2482,7 @@ int ssl_read_internal(SSL *s, void *buf, size_t num, size_t *readbytes)
     }
 }
 
+// MARK: SSL_read
 int SSL_read(SSL *s, void *buf, int num)
 {
     int ret;
@@ -2324,7 +2492,16 @@ int SSL_read(SSL *s, void *buf, int num)
         ERR_raise(ERR_LIB_SSL, SSL_R_BAD_LENGTH);
         return -1;
     }
-
+    // [DGTLS10GC] Start: Read data directly from dgBIO if HW_ENABLE=1
+    const char *econn = getenv("ECONN");
+    const char *hw_enable = getenv("HW_ENABLE");
+    if ( (econn!=NULL) && (strcmp("10",econn)==0) && (hw_enable!=NULL) && (strcmp("1",hw_enable)==0) )
+    {
+        BIO *rbio = SSL_get_rbio(s);
+        ret = BIO_read(rbio, buf, num);
+        return ret;
+    }
+    // [DGTLS10GC] End
     ret = ssl_read_internal(s, buf, (size_t)num, &readbytes);
 
     /*
@@ -2607,6 +2784,7 @@ ossl_ssize_t SSL_sendfile(SSL *s, int fd, off_t offset, size_t size, int flags)
 #endif
 }
 
+// MARK: SSL_write
 int SSL_write(SSL *s, const void *buf, int num)
 {
     int ret;
@@ -2616,6 +2794,18 @@ int SSL_write(SSL *s, const void *buf, int num)
         ERR_raise(ERR_LIB_SSL, SSL_R_BAD_LENGTH);
         return -1;
     }
+
+    // [DGTLS10GC] Start: Write data to dgBIO directly if HW_ENABLE=1
+    const char *econn = getenv("ECONN");
+    const char *hw_enable = getenv("HW_ENABLE");
+    if ( (econn!=NULL) && (strcmp("10",econn)==0) && (hw_enable!=NULL) && (strcmp("1",hw_enable)==0) )
+    {
+        BIO *wbio = SSL_get_wbio(s);
+        ret = BIO_write(wbio, buf, num);
+        return ret;
+
+    }
+    // [DGTLS10GC] End
 
     ret = ssl_write_internal(s, buf, (size_t)num, 0, &written);
 

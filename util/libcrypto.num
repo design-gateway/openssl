@@ -5548,3 +5548,16 @@ X509_STORE_get1_objects                 5675	3_3_0	EXIST::FUNCTION:
 OPENSSL_LH_set_thunks                   5676	3_3_0	EXIST::FUNCTION:
 OPENSSL_LH_doall_arg_thunk              5677	3_3_0	EXIST::FUNCTION:
 OSSL_HTTP_REQ_CTX_set_max_response_hdr_lines 5678	3_3_0	EXIST::FUNCTION:HTTP
+BIO_s_DG                                ?	3_3_2	EXIST::FUNCTION:
+splitStr                                ?	3_3_2	EXIST::FUNCTION:
+string_to_uint32_array                  ?	3_3_2	EXIST::FUNCTION:
+dg_keylog_callback                      ?	3_3_2	EXIST::FUNCTION:
+dg_ssl_info_callback                    ?	3_3_2	EXIST::FUNCTION:
+errno_to_name                           ?	3_3_2	EXIST::FUNCTION:
+get_phys_addr                           ?	3_3_2	EXIST::FUNCTION:
+set_sync_for_cpu                        ?	3_3_2	EXIST::FUNCTION:
+set_sync_for_device                     ?	3_3_2	EXIST::FUNCTION:
+dgcpy_tx_cache                          ?	3_3_2	EXIST::FUNCTION:
+dgcpy_rx_cache                          ?	3_3_2	EXIST::FUNCTION:
+regRead                                 ?	3_3_1	EXIST::FUNCTION:
+regWrite                                ?	3_3_1	EXIST::FUNCTION:
